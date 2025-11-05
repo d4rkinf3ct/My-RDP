@@ -1,0 +1,89 @@
+name: RDP-Connect
+
+on:
+  workflow_dispatch:
+
+jobs:
+  connect-only:
+    runs-on: windows-latest
+    # timeout-minutes is the max job runtime. Adjust as needed (6 hours max for public repos).
+    timeout-minutes: 360
+
+    env:
+      # read secrets into env for easy use in steps
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TARGET_TAILSCALE_IP: ${{ secrets.TARGET_TAILSCALE_IP }}
+      TARGET_RDP_USER: ${{ secrets.TARGET_RDP_USER }}
+      TARGET_RDP_PASSWORD: ${{ secrets.TARGET_RDP_PASSWORD }}
+
+    steps:
+      - name: Install Tailscale client
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Bring runner onto Tailscale
+        run: |
+          $auth = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if (-not $auth) {
+            Write-Error "TAILSCALE_AUTH_KEY is required as a secret"
+            exit 1
+          }
+          $hostname = "gh-runner-${env:GITHUB_RUN_ID}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$auth --hostname=$hostname
+          # wait a bit for an IP to be assigned
+          $tsIP = $null
+          $attempts = 0
+          while (-not $tsIP -and $attempts -lt 12) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $attempts++
+          }
+          if (-not $tsIP) {
+            Write-Error "Runner did not receive a Tailscale IP. Aborting."
+            exit 1
+          }
+          Write-Host "Runner Tailscale IP: $tsIP"
+
+      - name: Verify connectivity to target Tailscale IP (RDP port)
+        run: |
+          $target = "${{ secrets.TARGET_TAILSCALE_IP }}"
+          if (-not $target) {
+            Write-Error "TARGET_TAILSCALE_IP secret is required"
+            exit 1
+          }
+          Write-Host "Testing reachability to $target:3389 ..."
+          $test = Test-NetConnection -ComputerName $target -Port 3389 -InformationLevel Quiet
+          if (-not $test) {
+            Write-Error "TCP connection to $target:3389 failed. Check that the remote VM is online and has RDP enabled."
+            exit 1
+          }
+          Write-Host "TCP connectivity to $target:3389 succeeded."
+
+      - name: Expose remote credentials (masked)
+        run: |
+          # Save remote creds into environment so downstream steps (or you) can use them.
+          echo "TARGET_RDP_ADDRESS=${{ secrets.TARGET_TAILSCALE_IP }}" >> $env:GITHUB_ENV
+          echo "TARGET_RDP_USER=${{ secrets.TARGET_RDP_USER }}" >> $env:GITHUB_ENV
+          # Do NOT print the plain password to logs. Print a masked hint only:
+          $masked = ("*" * 6) + $([string]::Format(" (length={0})", ${{ secrets.TARGET_RDP_PASSWORD }}.Length))
+          Write-Host "Remote RDP user: $($env:TARGET_RDP_USER)"
+          Write-Host "Remote RDP address: $($env:TARGET_RDP_ADDRESS)"
+          Write-Host "Remote RDP password: $masked"
+          
+      - name: Keep job alive for interactive use
+        run: |
+          Write-Host "`n=== RDP ACCESS INFO ==="
+          Write-Host "Address: $env:TARGET_RDP_ADDRESS"
+          Write-Host "Username: $env:TARGET_RDP_USER"
+          Write-Host "Password: (hidden for security; stored as a repository secret)"
+          Write-Host "======================`n"
+          
+          # Keep runner active until manually cancelled (subject to GitHub job limits)
+          while ($true) {
+            Write-Host "[$(Get-Date)] Runner active - cancel the workflow to terminate."
+            Start-Sleep -Seconds 300
+          }
